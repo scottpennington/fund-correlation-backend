@@ -22,7 +22,6 @@ _holdings_cache = {}
 CACHE_TTL = 60 * 60 * 6  # 6 hours
 
 # Known ETF trust series: ticker -> {cik, series_id}
-# cik = the trust's CIK; series_id = GPIX's specific series within that trust
 KNOWN_SERIES = {
     'GPIX': {'cik': '0001479026', 'series_id': 'S000081511'},
     'GPIQ': {'cik': '0001479026', 'series_id': 'S000081510'},
@@ -77,79 +76,73 @@ def find_cik_for_ticker(ticker):
     return None
 
 
-def find_nport_by_series_id(series_id):
+def parse_accession(raw):
     """
-    Use EDGAR full-text search to find the most recent NPORT-P filing
-    for a specific series ID (e.g. S000081511 for GPIX).
-    Returns {cik, accession, date} or None.
+    Normalize an accession number to both formats we need:
+    - dashed:   0001752724-25-042696
+    - nodash:   000175272425042696  (18 chars, used in URLs)
+    Also extract the filer CIK (first 10 digits of the nodash form).
     """
-    url = (
-        f'https://efts.sec.gov/LATEST/search-index?'
-        f'q=%22{series_id}%22&forms=NPORT-P&dateRange=custom&startdt=2024-01-01'
-        f'&_source=period_of_report,file_date,entity_id,file_num,biz_location'
+    # Strip any extra characters
+    clean = raw.strip()
+
+    if '-' in clean:
+        # Already in dashed format: 0001752724-25-042696
+        dashed = clean
+        nodash = clean.replace('-', '')
+    else:
+        # Already nodash — insert dashes at positions 10 and 12
+        nodash = clean.zfill(18)
+        dashed = f'{nodash[:10]}-{nodash[10:12]}-{nodash[12:]}'
+
+    # The first 10 digits of nodash are the filer's CIK
+    filer_cik = nodash[:10]
+
+    return dashed, nodash, filer_cik
+
+
+def fetch_nport_xml(cik, accession_nodash):
+    """
+    Download the primary_doc.xml from an NPORT-P filing.
+    cik: 10-digit zero-padded string
+    accession_nodash: 18-char nodash accession e.g. 000175272425042696
+    """
+    cik_int = int(cik)
+
+    # Build the index URL — uses nodash accession in the path
+    index_url = (
+        f'https://www.sec.gov/Archives/edgar/data/'
+        f'{cik_int}/{accession_nodash}/{accession_nodash}-index.htm'
     )
-    r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
+
+    xml_url = None
+    try:
+        r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
+        if r.ok:
+            # Look for primary_doc.xml link
+            matches = re.findall(
+                r'href="(/Archives/edgar/data/[^"]+primary_doc\.xml)"', r.text
+            )
+            if not matches:
+                matches = re.findall(
+                    r'href="(/Archives/edgar/data/[^"]+\.xml)"', r.text
+                )
+            if matches:
+                xml_url = 'https://www.sec.gov' + matches[0]
+    except Exception:
+        pass
+
+    # Fallback: construct URL directly
+    if not xml_url:
+        xml_url = (
+            f'https://www.sec.gov/Archives/edgar/data/'
+            f'{cik_int}/{accession_nodash}/primary_doc.xml'
+        )
+
+    time.sleep(0.15)
+    r = requests.get(xml_url, headers=EDGAR_HEADERS, timeout=45)
     r.raise_for_status()
-    hits = r.json().get('hits', {}).get('hits', [])
-    if not hits:
-        return None
-
-    # Get the most recent hit
-    best = hits[0]
-    src = best.get('_source', {})
-    accession = best.get('_id', '').replace('-', '')
-    # The accession is in the _id field formatted as 0001234567-24-000001
-    raw_id = best.get('_id', '')
-
-    # Fetch the filing index to get CIK and confirm accession
-    index_url = f'https://www.sec.gov/Archives/edgar/data/'
-    # Parse CIK from entity_id or fetch the filing index directly
-    # Use the EDGAR search API instead
-    search_url = (
-        f'https://efts.sec.gov/LATEST/search-index?'
-        f'q=%22{series_id}%22&forms=NPORT-P&dateRange=custom&startdt=2024-01-01'
-    )
-    r2 = requests.get(search_url, headers=EDGAR_HEADERS, timeout=20)
-    r2.raise_for_status()
-    data = r2.json()
-
-    hits2 = data.get('hits', {}).get('hits', [])
-    if not hits2:
-        return None
-
-    # Extract filing details
-    hit = hits2[0]
-    accession_no = hit.get('_id', '')  # format: 0001234567-24-000001
-
-    # Get entity_id (CIK) from the filing
-    file_date = hit.get('_source', {}).get('file_date', '')
-    period = hit.get('_source', {}).get('period_of_report', '')
-
-    return {
-        'accession_no': accession_no,
-        'accession': accession_no.replace('-', ''),
-        'date': file_date or period
-    }
-
-
-def find_cik_from_accession(accession_no):
-    """Extract CIK from an EDGAR accession number by fetching the index."""
-    # Try EDGAR search API to get entity info
-    url = f'https://efts.sec.gov/LATEST/search-index?q=%22{accession_no}%22&forms=NPORT-P'
-    r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
-    if r.ok:
-        hits = r.json().get('hits', {}).get('hits', [])
-        if hits:
-            entity_id = hits[0].get('_source', {}).get('entity_id', '')
-            if entity_id:
-                return str(entity_id).zfill(10)
-
-    # Fallback: parse CIK from accession number prefix
-    # Accession format: XXXXXXXXXX-YY-ZZZZZZ where X is often the CIK
-    parts = accession_no.split('-')
-    if parts:
-        return parts[0].zfill(10)
-    return None
+    return r.content
 
 
 def get_latest_nport_for_cik(cik):
@@ -164,39 +157,51 @@ def get_latest_nport_for_cik(cik):
     dates = filings.get('filingDate', [])
     for i, form in enumerate(forms):
         if form in ('NPORT-P', 'NPORT-P/A'):
+            dashed, nodash, filer_cik = parse_accession(accessions[i])
             return {
                 'cik': cik,
-                'accession': accessions[i].replace('-', ''),
+                'accession_nodash': nodash,
                 'date': dates[i]
             }
     return None
 
 
-def fetch_nport_xml(cik, accession):
-    """Download the primary XML from an NPORT-P filing."""
-    cik_int = int(cik)
-    index_url = f'https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession}/{accession}-index.htm'
-    xml_url = None
-    try:
-        r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
-        if r.ok:
-            matches = re.findall(r'href="(/Archives/edgar/data/[^"]+primary_doc\.xml)"', r.text)
-            if not matches:
-                matches = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', r.text)
-            if matches:
-                xml_url = 'https://www.sec.gov' + matches[0]
-    except Exception:
-        pass
-    if not xml_url:
-        xml_url = f'https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession}/primary_doc.xml'
-    time.sleep(0.15)
-    r = requests.get(xml_url, headers=EDGAR_HEADERS, timeout=30)
+def find_nport_by_series_id(series_id, trust_cik):
+    """
+    Search EDGAR full-text search for NPORT-P filings containing a series ID.
+    Returns {cik, accession_nodash, date} for the most recent match.
+    """
+    search_url = (
+        f'https://efts.sec.gov/LATEST/search-index?'
+        f'q=%22{series_id}%22&forms=NPORT-P&dateRange=custom&startdt=2024-01-01'
+    )
+    r = requests.get(search_url, headers=EDGAR_HEADERS, timeout=20)
     r.raise_for_status()
-    return r.content
+    hits = r.json().get('hits', {}).get('hits', [])
+
+    if not hits:
+        return None
+
+    # Most recent hit is first
+    hit = hits[0]
+    raw_accession = hit.get('_id', '')
+    file_date = hit.get('_source', {}).get('file_date', '')
+    period = hit.get('_source', {}).get('period_of_report', file_date)
+
+    dashed, nodash, filer_cik = parse_accession(raw_accession)
+
+    # Use trust CIK for the URL path (that's where the filing lives)
+    cik_int = int(trust_cik)
+
+    return {
+        'cik': str(cik_int).zfill(10),
+        'accession_nodash': nodash,
+        'date': period or file_date
+    }
 
 
 def parse_nport_xml(xml_content):
-    """Parse holdings from N-PORT XML. Handles both single-fund and multi-series filings."""
+    """Parse holdings from N-PORT XML."""
     try:
         root = ET.fromstring(xml_content)
     except ET.ParseError:
@@ -218,49 +223,45 @@ def parse_nport_xml(xml_content):
                 return child.text.strip()
         return ''
 
-    def extract_from_node(node):
-        invstOrSecs = find_all(node, 'invstOrSec')
-        total_assets = 0
-        for tag in ['netAssets', 'totAssets']:
-            els = find_all(node, tag)
-            if els and els[0].text:
-                try:
-                    total_assets = float(els[0].text)
-                    break
-                except Exception:
-                    pass
+    invstOrSecs = find_all(root, 'invstOrSec')
+    total_assets = 0
+    for tag in ['netAssets', 'totAssets']:
+        els = find_all(root, tag)
+        if els and els[0].text:
+            try:
+                total_assets = float(els[0].text)
+                break
+            except Exception:
+                pass
 
-        holdings = []
-        for inv in invstOrSecs:
-            name = find_text(inv, 'name')
-            if not name:
-                continue
-            cusip = find_text(inv, 'cusip')
-            ticker = find_text(inv, 'ticker')
-            pct_val = find_text(inv, 'pctVal')
-            val_usd = find_text(inv, 'valUSD')
-            weight = 0.0
-            if pct_val:
-                try:
-                    weight = float(pct_val)
-                except Exception:
-                    pass
-            elif val_usd and total_assets > 0:
-                try:
-                    weight = (float(val_usd) / total_assets) * 100
-                except Exception:
-                    pass
-            holdings.append({
-                'name': name,
-                'cusip': cusip,
-                'ticker': ticker,
-                'weight': round(weight, 4)
-            })
-        holdings.sort(key=lambda x: x['weight'], reverse=True)
-        return holdings
+    holdings = []
+    for inv in invstOrSecs:
+        name = find_text(inv, 'name')
+        if not name:
+            continue
+        cusip = find_text(inv, 'cusip')
+        ticker = find_text(inv, 'ticker')
+        pct_val = find_text(inv, 'pctVal')
+        val_usd = find_text(inv, 'valUSD')
+        weight = 0.0
+        if pct_val:
+            try:
+                weight = float(pct_val)
+            except Exception:
+                pass
+        elif val_usd and total_assets > 0:
+            try:
+                weight = (float(val_usd) / total_assets) * 100
+            except Exception:
+                pass
+        holdings.append({
+            'name': name,
+            'cusip': cusip,
+            'ticker': ticker,
+            'weight': round(weight, 4)
+        })
 
-    # For single-series filings (most CEFs), parse the whole document
-    holdings = extract_from_node(root)
+    holdings.sort(key=lambda x: x['weight'], reverse=True)
     return holdings
 
 
@@ -306,56 +307,35 @@ def calculate_overlap(holdings_a, holdings_b):
 
 
 def get_fund_holdings(ticker):
-    """
-    Master holdings fetcher. Returns (holdings_list, filing_date).
-    For known trust ETFs: searches by series_id to get the right filing.
-    For direct filers (CEFs etc): uses CIK lookup directly.
-    """
+    """Master holdings fetcher. Returns (holdings, filing_date)."""
     ticker_upper = ticker.upper()
     now = time.time()
 
-    # Return cached result if fresh
     if ticker_upper in _holdings_cache:
         c = _holdings_cache[ticker_upper]
         if now - c['ts'] < CACHE_TTL:
             return c['holdings'], c['date']
 
-    # ── Path 1: Known trust ETFs (e.g. GPIX within Goldman Sachs ETF Trust) ──
+    # ── Path 1: Known trust ETFs ──
     if ticker_upper in KNOWN_SERIES:
         info = KNOWN_SERIES[ticker_upper]
-        cik = info['cik'].zfill(10)
+        trust_cik = info['cik']
         series_id = info['series_id']
 
-        # Search EDGAR for filings matching this series_id
-        search_url = (
-            f'https://efts.sec.gov/LATEST/search-index?'
-            f'q=%22{series_id}%22&forms=NPORT-P&dateRange=custom&startdt=2024-01-01'
-        )
         time.sleep(0.2)
-        r = requests.get(search_url, headers=EDGAR_HEADERS, timeout=20)
-        r.raise_for_status()
-        hits = r.json().get('hits', {}).get('hits', [])
-
-        if not hits:
+        filing = find_nport_by_series_id(series_id, trust_cik)
+        if not filing:
             return None, None
 
-        # Pick the most recent filing
-        best_hit = hits[0]
-        accession_no = best_hit.get('_id', '')
-        file_date = best_hit.get('_source', {}).get('file_date', '')
-        period = best_hit.get('_source', {}).get('period_of_report', file_date)
-
-        # CIK is embedded in the accession number prefix
-        accession_clean = accession_no.replace('-', '')
-        cik_from_accession = accession_no.split('-')[0].zfill(10)
-
         time.sleep(0.2)
-        xml_content = fetch_nport_xml(cik_from_accession, accession_clean)
-        holdings = parse_nport_xml(xml_content)
+        xml = fetch_nport_xml(filing['cik'], filing['accession_nodash'])
+        holdings = parse_nport_xml(xml)
 
         if holdings:
-            _holdings_cache[ticker_upper] = {'holdings': holdings, 'date': period, 'ts': now}
-        return holdings, period
+            _holdings_cache[ticker_upper] = {
+                'holdings': holdings, 'date': filing['date'], 'ts': now
+            }
+        return holdings, filing['date']
 
     # ── Path 2: Direct filers (CEFs, independent ETFs) ──
     cik = find_cik_for_ticker(ticker_upper)
@@ -368,11 +348,13 @@ def get_fund_holdings(ticker):
         return None, None
 
     time.sleep(0.2)
-    xml_content = fetch_nport_xml(filing['cik'], filing['accession'])
-    holdings = parse_nport_xml(xml_content)
+    xml = fetch_nport_xml(filing['cik'], filing['accession_nodash'])
+    holdings = parse_nport_xml(xml)
 
     if holdings:
-        _holdings_cache[ticker_upper] = {'holdings': holdings, 'date': filing['date'], 'ts': now}
+        _holdings_cache[ticker_upper] = {
+            'holdings': holdings, 'date': filing['date'], 'ts': now
+        }
     return holdings, filing['date']
 
 
@@ -396,6 +378,7 @@ def holdings_overlap():
         if not holdings_b:
             return jsonify({'error': f'Could not retrieve holdings for {ticker_b}. '
                                      f'It may not file N-PORT reports with the SEC.'}), 404
+
         overlap = calculate_overlap(holdings_a, holdings_b)
         return jsonify({
             'ticker_a': ticker_a,
@@ -418,7 +401,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '4.0'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '5.0'})
 
 
 if __name__ == '__main__':
