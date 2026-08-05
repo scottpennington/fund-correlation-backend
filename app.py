@@ -4,6 +4,7 @@ import yfinance as yf
 import requests
 import xml.etree.ElementTree as ET
 import time
+import re
 
 app = Flask(__name__)
 CORS(app)
@@ -14,7 +15,47 @@ EDGAR_HEADERS = {
 }
 
 # ─────────────────────────────────────────
-# PRICES ENDPOINT (existing)
+# IN-MEMORY CACHE
+# ─────────────────────────────────────────
+
+_ticker_cik_cache = {}   # ticker -> cik
+_company_tickers = None  # full SEC tickers file, loaded once
+_holdings_cache = {}     # "TICKER" -> {holdings, timestamp}
+CACHE_TTL = 60 * 60 * 6  # 6 hours
+
+
+def get_company_tickers():
+    """Load SEC company tickers file once and cache in memory."""
+    global _company_tickers
+    if _company_tickers is not None:
+        return _company_tickers
+    url = 'https://www.sec.gov/files/company_tickers.json'
+    r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
+    r.raise_for_status()
+    _company_tickers = r.json()
+    return _company_tickers
+
+
+def get_cik_via_company_search(ticker):
+    """Find CIK for a ticker using cached SEC company tickers file."""
+    ticker_upper = ticker.upper()
+
+    if ticker_upper in _ticker_cik_cache:
+        return _ticker_cik_cache[ticker_upper]
+
+    companies = get_company_tickers()
+    for key, val in companies.items():
+        if val.get('ticker', '').upper() == ticker_upper:
+            cik = str(val['cik_str']).zfill(10)
+            _ticker_cik_cache[ticker_upper] = cik
+            return cik
+
+    _ticker_cik_cache[ticker_upper] = None
+    return None
+
+
+# ─────────────────────────────────────────
+# PRICES ENDPOINT
 # ─────────────────────────────────────────
 
 @app.route('/api/prices')
@@ -49,74 +90,13 @@ def get_prices():
 
 
 # ─────────────────────────────────────────
-# HOLDINGS OVERLAP ENDPOINT (new)
+# HOLDINGS HELPERS
 # ─────────────────────────────────────────
 
-def get_cik_for_ticker(ticker):
-    """Look up a fund's CIK number from its ticker using SEC EDGAR."""
-    url = f'https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&dateRange=custom&startdt=2020-01-01&forms=NPORT-P'
-    # Use the company search endpoint instead
-    url = f'https://www.sec.gov/cgi-bin/browse-edgar?company=&CIK={ticker}&type=NPORT-P&dateb=&owner=include&count=5&search_text=&action=getcompany&output=atom'
-    r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
-    r.raise_for_status()
-
-    # Parse the Atom feed to get CIK
-    root = ET.fromstring(r.content)
-    ns = {'atom': 'http://www.w3.org/2005/Atom'}
-    entries = root.findall('atom:entry', ns)
-    if not entries:
-        return None
-
-    # Extract CIK from the first entry's company-info link
-    for entry in entries:
-        company_info = entry.find('atom:content/atom:company-info', ns)
-        if company_info is not None:
-            cik_el = company_info.find('atom:cik', ns)
-            if cik_el is not None:
-                return cik_el.text.zfill(10)
-
-    # Fallback: try the submissions API
-    url2 = f'https://data.sec.gov/submissions/CIK{ticker}.json'
-    try:
-        r2 = requests.get(url2, headers=EDGAR_HEADERS, timeout=10)
-        if r2.ok:
-            data = r2.json()
-            return str(data.get('cik', '')).zfill(10)
-    except:
-        pass
-
-    return None
-
-
-def get_cik_via_company_search(ticker):
-    """Search EDGAR company search for a ticker to find its CIK."""
-    url = f'https://efts.sec.gov/LATEST/search-index?q=ticker%3A{ticker}&forms=NPORT-P&dateRange=custom&startdt=2023-01-01'
-    try:
-        r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
-        if r.ok:
-            data = r.json()
-            hits = data.get('hits', {}).get('hits', [])
-            if hits:
-                return str(hits[0].get('_source', {}).get('period_of_report', ''))
-    except:
-        pass
-
-    # Use the ticker-to-CIK mapping from SEC
-    url2 = 'https://www.sec.gov/files/company_tickers.json'
-    r2 = requests.get(url2, headers=EDGAR_HEADERS, timeout=15)
-    r2.raise_for_status()
-    companies = r2.json()
-    ticker_upper = ticker.upper()
-    for key, val in companies.items():
-        if val.get('ticker', '').upper() == ticker_upper:
-            return str(val['cik_str']).zfill(10)
-    return None
-
-
 def get_latest_nport_filing(cik):
-    """Fetch the most recent NPORT-P filing accession number for a given CIK."""
+    """Get the most recent NPORT-P accession number for a CIK."""
     url = f'https://data.sec.gov/submissions/CIK{cik}.json'
-    r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
+    r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
     r.raise_for_status()
     data = r.json()
 
@@ -125,7 +105,6 @@ def get_latest_nport_filing(cik):
     accession_numbers = filings.get('accessionNumber', [])
     filing_dates = filings.get('filingDate', [])
 
-    # Find the most recent NPORT-P
     for i, form in enumerate(form_types):
         if form in ('NPORT-P', 'NPORT-P/A'):
             return {
@@ -137,90 +116,66 @@ def get_latest_nport_filing(cik):
 
 
 def get_holdings_from_nport(cik, accession):
-    """Parse holdings from an NPORT-P filing XML."""
-    # Construct the filing index URL
-    accession_dashes = f'{accession[:10]}-{accession[10:12]}-{accession[12:]}'
-    index_url = f'https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/primary_doc.xml'
+    """Download and parse holdings from an NPORT-P XML filing."""
+    cik_int = int(cik)
 
-    # Try to get the filing index first to find the right XML file
-    index_page_url = f'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=NPORT-P&dateb=&owner=include&count=1'
-
-    # Fetch the filing index
-    filing_index_url = f'https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{accession}-index.htm'
-    r = requests.get(filing_index_url, headers=EDGAR_HEADERS, timeout=15)
-
+    # Try to find the XML file via the filing index page
+    index_url = f'https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession}/{accession}-index.htm'
     xml_url = None
-    if r.ok:
-        # Find the primary XML document
-        content = r.text
-        for line in content.split('\n'):
-            if 'primary_doc.xml' in line or ('NPORT' in line.upper() and '.xml' in line.lower()):
-                import re
-                match = re.search(r'href="([^"]+\.xml)"', line)
-                if match:
-                    xml_url = 'https://www.sec.gov' + match.group(1)
-                    break
+
+    try:
+        r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
+        if r.ok:
+            matches = re.findall(r'href="(/Archives/edgar/data/[^"]+primary_doc\.xml)"', r.text)
+            if matches:
+                xml_url = 'https://www.sec.gov' + matches[0]
+            else:
+                matches = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', r.text)
+                if matches:
+                    xml_url = 'https://www.sec.gov' + matches[0]
+    except Exception:
+        pass
 
     if not xml_url:
-        xml_url = f'https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/primary_doc.xml'
+        xml_url = f'https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession}/primary_doc.xml'
 
-    time.sleep(0.1)  # Be polite to SEC servers
+    time.sleep(0.15)
     r = requests.get(xml_url, headers=EDGAR_HEADERS, timeout=30)
     r.raise_for_status()
-
     return parse_nport_xml(r.content)
 
 
 def parse_nport_xml(xml_content):
-    """Extract holdings from N-PORT XML content."""
+    """Extract holdings list from N-PORT XML."""
     try:
         root = ET.fromstring(xml_content)
     except ET.ParseError:
         return []
 
-    # N-PORT XML uses namespaces
-    ns_map = {
-        'nport': 'http://www.sec.gov/edgar/nport',
-        '': ''
-    }
-
-    holdings = []
-
-    # Try with namespace first, then without
     def find_all(root, tag):
-        # Try common N-PORT namespaces
-        namespaces = [
+        for ns in [
             'http://www.sec.gov/edgar/nport',
             'http://www.sec.gov/edgar/nportfund',
             ''
-        ]
-        for ns in namespaces:
-            if ns:
-                results = root.findall(f'.//{{{ns}}}{tag}')
-            else:
-                results = root.findall(f'.//{tag}')
+        ]:
+            results = root.findall(f'.//{{{ns}}}{tag}') if ns else root.findall(f'.//{tag}')
             if results:
                 return results
         return []
 
     def find_text(el, tag):
-        namespaces = [
+        for ns in [
             'http://www.sec.gov/edgar/nport',
             'http://www.sec.gov/edgar/nportfund',
             ''
-        ]
-        for ns in namespaces:
-            if ns:
-                child = el.find(f'{{{ns}}}{tag}')
-            else:
-                child = el.find(tag)
+        ]:
+            child = el.find(f'{{{ns}}}{tag}') if ns else el.find(tag)
             if child is not None and child.text:
                 return child.text.strip()
         return ''
 
     invstOrSecs = find_all(root, 'invstOrSec')
 
-    # Get total net assets for weight calculation
     total_assets = 0
     for tag in ['netAssets', 'totAssets']:
         els = find_all(root, tag)
@@ -228,9 +183,10 @@ def parse_nport_xml(xml_content):
             try:
                 total_assets = float(els[0].text)
                 break
-            except:
+            except Exception:
                 pass
 
+    holdings = []
     for invst in invstOrSecs:
         name = find_text(invst, 'name')
         cusip = find_text(invst, 'cusip')
@@ -241,17 +197,16 @@ def parse_nport_xml(xml_content):
         if not name:
             continue
 
-        # Calculate weight
         weight = 0.0
         if pct_val:
             try:
                 weight = float(pct_val)
-            except:
+            except Exception:
                 pass
         elif val_usd and total_assets > 0:
             try:
                 weight = (float(val_usd) / total_assets) * 100
-            except:
+            except Exception:
                 pass
 
         holdings.append({
@@ -261,44 +216,32 @@ def parse_nport_xml(xml_content):
             'weight': round(weight, 4)
         })
 
-    # Sort by weight descending
     holdings.sort(key=lambda x: x['weight'], reverse=True)
     return holdings
 
 
 def normalize_key(holding):
     """Return the best identifier for matching holdings across funds."""
-    if holding.get('cusip') and len(holding['cusip']) >= 6:
-        return ('cusip', holding['cusip'])
-    if holding.get('ticker') and holding['ticker'].strip():
-        return ('ticker', holding['ticker'].upper().strip())
-    # Fall back to normalized name
+    cusip = holding.get('cusip', '').strip()
+    if cusip and len(cusip) >= 6 and cusip.upper() not in ('N/A', 'NA', '000000000'):
+        return ('cusip', cusip)
+    ticker = holding.get('ticker', '').strip()
+    if ticker and ticker.upper() not in ('N/A', 'NA', ''):
+        return ('ticker', ticker.upper())
     name = holding.get('name', '').upper().strip()
-    # Remove common suffixes for better matching
-    for suffix in [' COM', ' COMMON', ' INC', ' CORP', ' LTD', ' CLASS A', ' CLASS B', ' CL A', ' CL B']:
+    for suffix in [' COM', ' COMMON STOCK', ' INC', ' CORP', ' LTD', ' CLASS A', ' CLASS B', ' CL A', ' CL B', ' CLASS C']:
         name = name.replace(suffix, '')
     return ('name', name.strip())
 
 
 def calculate_overlap(holdings_a, holdings_b):
-    """Calculate weighted overlap between two sets of holdings."""
-    # Build lookup dictionaries
-    map_a = {}
-    for h in holdings_a:
-        key = normalize_key(h)
-        map_a[key] = h
+    """Calculate weighted overlap between two holdings lists."""
+    map_a = {normalize_key(h): h for h in holdings_a}
+    map_b = {normalize_key(h): h for h in holdings_b}
 
-    map_b = {}
-    for h in holdings_b:
-        key = normalize_key(h)
-        map_b[key] = h
+    common_keys = set(map_a.keys()) & set(map_b.keys())
 
-    # Find shared holdings
     shared = []
-    keys_a = set(map_a.keys())
-    keys_b = set(map_b.keys())
-    common_keys = keys_a & keys_b
-
     for key in common_keys:
         h_a = map_a[key]
         h_b = map_b[key]
@@ -311,22 +254,23 @@ def calculate_overlap(holdings_a, holdings_b):
             'avg_weight': round((h_a['weight'] + h_b['weight']) / 2, 4)
         })
 
-    # Sort shared by average weight
     shared.sort(key=lambda x: x['avg_weight'], reverse=True)
 
-    # Calculate overlap percentages
     overlap_by_a = sum(h['weight_a'] for h in shared)
     overlap_by_b = sum(h['weight_b'] for h in shared)
-    overlap_avg = (overlap_by_a + overlap_by_b) / 2
 
     return {
         'shared_count': len(shared),
         'overlap_pct_a': round(overlap_by_a, 2),
         'overlap_pct_b': round(overlap_by_b, 2),
-        'overlap_pct_avg': round(overlap_avg, 2),
-        'shared_holdings': shared[:50]  # Return top 50 shared
+        'overlap_pct_avg': round((overlap_by_a + overlap_by_b) / 2, 2),
+        'shared_holdings': shared[:50]
     }
 
+
+# ─────────────────────────────────────────
+# HOLDINGS OVERLAP ENDPOINT
+# ─────────────────────────────────────────
 
 @app.route('/api/holdings-overlap')
 def holdings_overlap():
@@ -337,62 +281,81 @@ def holdings_overlap():
         return jsonify({'error': 'Both tickerA and tickerB are required'}), 400
 
     try:
-        # Step 1: Look up CIKs
+        # Step 1: Resolve CIKs (uses cached tickers file)
         cik_a = get_cik_via_company_search(ticker_a)
         if not cik_a:
-            return jsonify({'error': f'Could not find SEC EDGAR filing for {ticker_a}. It may not file N-PORT reports.'}), 404
+            return jsonify({'error': f'Could not find {ticker_a} in SEC EDGAR. It may not file N-PORT reports.'}), 404
 
-        time.sleep(0.2)  # Respect SEC rate limits
+        time.sleep(0.15)
 
         cik_b = get_cik_via_company_search(ticker_b)
         if not cik_b:
-            return jsonify({'error': f'Could not find SEC EDGAR filing for {ticker_b}. It may not file N-PORT reports.'}), 404
+            return jsonify({'error': f'Could not find {ticker_b} in SEC EDGAR. It may not file N-PORT reports.'}), 404
 
-        # Step 2: Get latest N-PORT filing for each
-        filing_a = get_latest_nport_filing(cik_a)
-        if not filing_a:
-            return jsonify({'error': f'No N-PORT filing found for {ticker_a}'}), 404
+        # Check holdings cache
+        cache_key_a = ticker_a
+        cache_key_b = ticker_b
+        now = time.time()
+
+        if cache_key_a in _holdings_cache and now - _holdings_cache[cache_key_a]['ts'] < CACHE_TTL:
+            holdings_a = _holdings_cache[cache_key_a]['data']
+            filing_date_a = _holdings_cache[cache_key_a]['date']
+        else:
+            filing_a = get_latest_nport_filing(cik_a)
+            if not filing_a:
+                return jsonify({'error': f'No N-PORT filing found for {ticker_a}'}), 404
+            time.sleep(0.2)
+            holdings_a = get_holdings_from_nport(cik_a, filing_a['accession'])
+            filing_date_a = filing_a['date']
+            if holdings_a:
+                _holdings_cache[cache_key_a] = {'data': holdings_a, 'ts': now, 'date': filing_date_a}
 
         time.sleep(0.2)
 
-        filing_b = get_latest_nport_filing(cik_b)
-        if not filing_b:
-            return jsonify({'error': f'No N-PORT filing found for {ticker_b}'}), 404
-
-        # Step 3: Fetch and parse holdings
-        holdings_a = get_holdings_from_nport(cik_a, filing_a['accession'])
-        time.sleep(0.3)
-        holdings_b = get_holdings_from_nport(cik_b, filing_b['accession'])
+        if cache_key_b in _holdings_cache and now - _holdings_cache[cache_key_b]['ts'] < CACHE_TTL:
+            holdings_b = _holdings_cache[cache_key_b]['data']
+            filing_date_b = _holdings_cache[cache_key_b]['date']
+        else:
+            filing_b = get_latest_nport_filing(cik_b)
+            if not filing_b:
+                return jsonify({'error': f'No N-PORT filing found for {ticker_b}'}), 404
+            time.sleep(0.2)
+            holdings_b = get_holdings_from_nport(cik_b, filing_b['accession'])
+            filing_date_b = filing_b['date']
+            if holdings_b:
+                _holdings_cache[cache_key_b] = {'data': holdings_b, 'ts': now, 'date': filing_date_b}
 
         if not holdings_a:
             return jsonify({'error': f'Could not parse holdings for {ticker_a}'}), 500
         if not holdings_b:
             return jsonify({'error': f'Could not parse holdings for {ticker_b}'}), 500
 
-        # Step 4: Calculate overlap
         overlap = calculate_overlap(holdings_a, holdings_b)
 
         return jsonify({
             'ticker_a': ticker_a,
             'ticker_b': ticker_b,
-            'filing_date_a': filing_a['date'],
-            'filing_date_b': filing_b['date'],
+            'filing_date_a': filing_date_a,
+            'filing_date_b': filing_date_b,
             'total_holdings_a': len(holdings_a),
             'total_holdings_b': len(holdings_b),
             **overlap
         })
 
     except requests.exceptions.Timeout:
-        return jsonify({'error': 'SEC EDGAR request timed out. Please try again.'}), 504
+        return jsonify({'error': 'SEC EDGAR timed out. Please try again in a moment.'}), 504
+    except requests.exceptions.HTTPError as e:
+        if '429' in str(e):
+            return jsonify({'error': 'SEC EDGAR is temporarily rate-limiting requests. Please wait 30 seconds and try again.'}), 429
+        return jsonify({'error': f'HTTP error: {str(e)}'}), 500
     except Exception as e:
-        return jsonify({'error': f'Error fetching holdings: {str(e)}'}), 500
+        return jsonify({'error': f'Error: {str(e)}'}), 500
 
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '2.0'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '2.1'})
 
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
-
