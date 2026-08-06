@@ -251,42 +251,83 @@ def get_submissions_filings(cik):
 
 def find_nport_for_series(cik, series_id, class_id=None):
     """
-    Find the most recent NPORT-P filing for a specific series
-    by checking each filing's index page for the series_id.
+    Find the most recent NPORT-P filing for a specific series by downloading
+    the first chunk of each XML file and checking for the series ID.
+    This is more reliable than checking index pages which don't contain series IDs.
     """
     nports = get_submissions_filings(cik)
 
-    for filing in nports[:30]:  # Check up to 30 most recent NPORT-Ps
+    for filing in nports[:30]:
         acc = filing['accession']
         nodash = to_nodash(acc)
+        filer_cik_int = int(nodash[:10])
         dashed = to_dashed(acc)
-        cik_int = int(cik)
 
-        # Use the filer CIK embedded in the accession number
-        filer_cik_int = int(to_nodash(acc)[:10])
-
-        # Try both .htm and .html index URL variants
+        # First get the index page to find the XML URL
+        xml_url = None
         for ext in ['.htm', '.html']:
             index_url = (
                 f'https://www.sec.gov/Archives/edgar/data/{filer_cik_int}/'
                 f'{nodash}/{dashed}-index{ext}'
             )
             try:
-                time.sleep(0.12)
-                r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=12)
+                time.sleep(0.5)  # Generous delay to avoid rate limits
+                r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
                 if r.ok:
-                    content = r.text
-                    # Check if this filing belongs to our series
-                    if series_id in content:
-                        return {'cik': str(filer_cik_int), 'accession': acc, 'date': filing['date']}
-                    # Also check class_id if provided
-                    if class_id and class_id in content:
-                        return {'cik': str(filer_cik_int), 'accession': acc, 'date': filing['date']}
-                    break  # Index page found but wrong series; move on
+                    matches = re.findall(
+                        r'href="(/Archives/edgar/data/[^"]*primary_doc\.xml)"',
+                        r.text, re.IGNORECASE
+                    )
+                    if not matches:
+                        matches = re.findall(
+                            r'href="(/Archives/edgar/data/[^"]*\.xml)"',
+                            r.text, re.IGNORECASE
+                        )
+                    if matches:
+                        xml_url = 'https://www.sec.gov' + matches[0]
+                    break
+                elif r.status_code == 429:
+                    time.sleep(5)  # Back off on rate limit
+                    continue
             except Exception:
                 continue
 
+        if not xml_url:
+            xml_url = (
+                f'https://www.sec.gov/Archives/edgar/data/{filer_cik_int}/'
+                f'{nodash}/primary_doc.xml'
+            )
+
+        # Fetch just the first 4000 bytes of the XML to check series ID
+        try:
+            time.sleep(0.5)
+            r = requests.get(
+                xml_url, headers={**EDGAR_HEADERS, 'Range': 'bytes=0-4000'},
+                timeout=15
+            )
+            if r.status_code in (200, 206):
+                chunk = r.text
+                if series_id in chunk:
+                    return {
+                        'cik': str(filer_cik_int),
+                        'accession': acc,
+                        'date': filing['date'],
+                        'xml_url': xml_url
+                    }
+                if class_id and class_id in chunk:
+                    return {
+                        'cik': str(filer_cik_int),
+                        'accession': acc,
+                        'date': filing['date'],
+                        'xml_url': xml_url
+                    }
+            elif r.status_code == 429:
+                time.sleep(10)  # Back off significantly
+        except Exception:
+            continue
+
     return None
+
 
 
 def get_latest_nport_for_cik(cik):
@@ -477,8 +518,15 @@ def get_fund_holdings(ticker):
         if not filing:
             return None, None
 
-        time.sleep(0.2)
-        xml = fetch_nport_xml(filing['cik'], filing['accession'])
+        # If find_nport_for_series already found the XML URL, use it directly
+        if filing.get('xml_url'):
+            time.sleep(0.5)
+            r = requests.get(filing['xml_url'], headers=EDGAR_HEADERS, timeout=45)
+            r.raise_for_status()
+            xml = r.content
+        else:
+            time.sleep(0.5)
+            xml = fetch_nport_xml(filing['cik'], filing['accession'])
         holdings = parse_nport_xml(xml)
         if holdings:
             _holdings_cache[ticker_upper] = {
@@ -548,7 +596,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.3'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.4'})
 
 
 if __name__ == '__main__':
