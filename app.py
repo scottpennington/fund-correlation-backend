@@ -329,20 +329,19 @@ def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None
                 f'{nodash}/{dashed}-index{ext}'
             )
             try:
-                time.sleep(0.3)  # Polite but not too slow
+                time.sleep(0.3)
                 r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=10)
                 if r.ok:
-                    matches = re.findall(
-                        r'href="(/Archives/edgar/data/[^"]*primary_doc\.xml)"',
+                    # Find all XML links — prefer raw primary_doc.xml over xsl viewer
+                    all_xml = re.findall(
+                        r'href="(/Archives/edgar/data/[^"]*\.xml)"',
                         r.text, re.IGNORECASE
                     )
-                    if not matches:
-                        matches = re.findall(
-                            r'href="(/Archives/edgar/data/[^"]*\.xml)"',
-                            r.text, re.IGNORECASE
-                        )
-                    if matches:
-                        xml_url = 'https://www.sec.gov' + matches[0]
+                    # Skip xsl-rendered versions, prefer the raw file
+                    raw_xml = [x for x in all_xml if 'xsl' not in x.lower()]
+                    chosen = raw_xml[0] if raw_xml else (all_xml[0] if all_xml else None)
+                    if chosen:
+                        xml_url = 'https://www.sec.gov' + chosen
                     break
                 elif r.status_code == 429:
                     time.sleep(3)
@@ -398,36 +397,30 @@ def get_latest_nport_for_cik(cik):
 
 
 def fetch_nport_xml(cik, accession):
-    """Download primary_doc.xml from an NPORT-P filing."""
+    """Download raw primary_doc.xml from an NPORT-P filing."""
     nodash = to_nodash(accession)
     dashed = to_dashed(accession)
-    # The filer CIK is embedded in the accession number's first 10 digits
-    filer_cik = int(nodash[:10])
-    cik_int = filer_cik if filer_cik > 0 else int(cik)
+    # Use CIK as provided — for trust ETFs this should be the trust CIK
+    cik_int = int(cik)
     base = f'https://www.sec.gov/Archives/edgar/data/{cik_int}/{nodash}'
 
     xml_url = None
 
-    # Try index page (.htm then .html)
     for ext in ['.htm', '.html']:
         index_url = f'{base}/{dashed}-index{ext}'
         try:
             r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=12)
             if r.ok:
-                matches = re.findall(
-                    r'href="(/Archives/edgar/data/[^"]*primary_doc\.xml)"',
-                    r.text, re.IGNORECASE
-                )
-                if matches:
-                    xml_url = 'https://www.sec.gov' + matches[0]
-                    break
-                matches = re.findall(
+                all_xml = re.findall(
                     r'href="(/Archives/edgar/data/[^"]*\.xml)"',
                     r.text, re.IGNORECASE
                 )
-                if matches:
-                    xml_url = 'https://www.sec.gov' + matches[0]
-                    break
+                # Skip xsl-rendered versions
+                raw_xml = [x for x in all_xml if 'xsl' not in x.lower()]
+                chosen = raw_xml[0] if raw_xml else (all_xml[0] if all_xml else None)
+                if chosen:
+                    xml_url = 'https://www.sec.gov' + chosen
+                break
         except Exception:
             continue
 
@@ -582,13 +575,14 @@ def get_fund_holdings(ticker):
 
         # If find_nport_for_series already found the XML URL, use it directly
         if filing.get('xml_url'):
-            time.sleep(0.5)
+            time.sleep(0.3)
             r = requests.get(filing['xml_url'], headers=EDGAR_HEADERS, timeout=45)
             r.raise_for_status()
             xml = r.content
         else:
-            time.sleep(0.5)
-            xml = fetch_nport_xml(filing['cik'], filing['accession'])
+            time.sleep(0.3)
+            # Files live under trust_cik on sec.gov/Archives
+            xml = fetch_nport_xml(trust_cik, filing['accession'])
         holdings = parse_nport_xml(xml)
         if holdings:
             _holdings_cache[ticker_upper] = {
@@ -658,7 +652,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.6'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.7'})
 
 
 if __name__ == '__main__':
