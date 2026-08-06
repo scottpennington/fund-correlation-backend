@@ -68,39 +68,58 @@ def get_prices():
 # DIAGNOSTIC ENDPOINT
 # ─────────────────────────────────────────
 
-@app.route('/api/debug-index')
-def debug_index():
-    """Fetch raw text of an NPORT-P filing index page to inspect its contents."""
-    accession = request.args.get('accession', '0000940400-26-028192')
-    nodash = accession.replace('-', '').zfill(18)
-    dashed = f'{nodash[:10]}-{nodash[10:12]}-{nodash[12:]}'
-    filer_cik = int(nodash[:10])
-    results = {'accession': accession, 'nodash': nodash, 'filer_cik': filer_cik}
-    for ext in ['.htm', '.html']:
-        url = f'https://www.sec.gov/Archives/edgar/data/{filer_cik}/{nodash}/{dashed}-index{ext}'
-        results[f'url{ext}'] = url
+@app.route('/api/debug-scan')
+def debug_scan():
+    """
+    Scan all recent NPORT-P filings for a filing agent CIK and extract
+    the series table from each index page. This tells us which accession
+    belongs to which series/ticker so we can match them correctly.
+    """
+    # These are the 10 NPORT-P filings we found for Goldman Sachs ETF Trust
+    # filed on 2026-07-24 under filing agent CIK 940400
+    accessions = [
+        '0000940400-26-028192',
+        '0000940400-26-028191',
+        '0000940400-26-028190',
+        '0000940400-26-028186',
+        '0000940400-26-028185',
+        '0000940400-26-028184',
+        '0000940400-26-028141',
+        '0000940400-26-028140',
+        '0000940400-26-028139',
+        '0000940400-26-028137',
+    ]
+
+    results = []
+    for acc in accessions:
+        nodash = acc.replace('-', '').zfill(18)
+        dashed = f'{nodash[:10]}-{nodash[10:12]}-{nodash[12:]}'
+        filer_cik = int(nodash[:10])
+        url = f'https://www.sec.gov/Archives/edgar/data/{filer_cik}/{nodash}/{dashed}-index.htm'
+        entry = {'accession': acc, 'url': url}
         try:
+            time.sleep(0.2)
             r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
-            results[f'status{ext}'] = r.status_code
             if r.ok:
                 full = r.text
-                results['content_length'] = len(full)
-                results['content'] = full[:500]  # just the start
-                # Search for key identifiers
-                results['has_S000081511'] = 'S000081511' in full
-                results['has_C000244421'] = 'C000244421' in full
-                results['has_GPIX'] = 'GPIX' in full
-                # Extract a snippet around any series ID found
-                for needle in ['S000081511', 'C000244421', 'GPIX', 'seriesId', 'Series']:
-                    idx = full.find(needle)
-                    if idx >= 0:
-                        results[f'snippet_{needle}'] = full[max(0,idx-100):idx+200]
-                results['found'] = True
-                return jsonify(results)
+                # Extract series table content
+                idx = full.find('seriesDiv')
+                if idx >= 0:
+                    entry['series_section'] = full[idx:idx+1000]
+                else:
+                    # Try to find any series/class identifiers
+                    idx2 = full.find('Series')
+                    entry['series_section'] = full[idx2:idx2+500] if idx2 >= 0 else 'NOT FOUND'
+                entry['has_GPIX'] = 'GPIX' in full
+                entry['has_S000081511'] = 'S000081511' in full
+                entry['status'] = 200
+            else:
+                entry['status'] = r.status_code
         except Exception as e:
-            results[f'error{ext}'] = str(e)
-    results['found'] = False
-    return jsonify(results)
+            entry['error'] = str(e)
+        results.append(entry)
+
+    return jsonify({'filings_scanned': len(results), 'results': results})
 
 
 @app.route('/api/debug-submissions')
@@ -529,7 +548,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.2'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.3'})
 
 
 if __name__ == '__main__':
