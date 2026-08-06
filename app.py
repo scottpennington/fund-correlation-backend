@@ -70,8 +70,63 @@ def get_prices():
 # DIAGNOSTIC ENDPOINT
 # ─────────────────────────────────────────
 
-@app.route('/api/debug-scan')
-def debug_scan():
+@app.route('/api/debug-gpix')
+def debug_gpix():
+    """Step-by-step diagnostic for GPIX holdings lookup."""
+    import traceback
+    results = {}
+    try:
+        info = HARDCODED_FILINGS['GPIX']
+        trust_cik = info['trust_cik']
+        filer_cik = info['filer_cik']
+        series_id = info['series_id']
+        results['step1'] = f'Looking up submissions for trust CIK {trust_cik}'
+
+        nports = get_submissions_filings(trust_cik)
+        results['step2'] = f'Found {len(nports)} NPORT-P filings'
+        results['first_3'] = nports[:3]
+
+        if not nports:
+            return jsonify(results)
+
+        # Try just the first filing
+        acc = nports[0]['accession']
+        nodash = to_nodash(acc)
+        dashed = to_dashed(acc)
+        filer_cik_int = int(filer_cik)
+        results['step3'] = f'Trying accession {acc}, filer CIK {filer_cik_int}'
+
+        # Try index page
+        index_url = f'https://www.sec.gov/Archives/edgar/data/{filer_cik_int}/{nodash}/{dashed}-index.htm'
+        results['index_url'] = index_url
+        r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
+        results['index_status'] = r.status_code
+
+        if r.ok:
+            full = r.text
+            results['index_length'] = len(full)
+            results['has_series_id'] = series_id in full
+            # Find XML link
+            matches = re.findall(r'href="(/Archives/edgar/data/[^"]*\.xml)"', full, re.IGNORECASE)
+            results['xml_links'] = matches[:3]
+
+            if matches:
+                xml_url = 'https://www.sec.gov' + matches[0]
+                results['xml_url'] = xml_url
+                # Fetch first 2000 bytes
+                r2 = requests.get(xml_url, headers={**EDGAR_HEADERS, 'Range': 'bytes=0-2000'}, timeout=15)
+                results['xml_status'] = r2.status_code
+                if r2.status_code in (200, 206):
+                    results['xml_chunk'] = r2.text[:1000]
+                    results['xml_has_series_id'] = series_id in r2.text
+
+    except Exception as e:
+        results['error'] = str(e)
+        results['traceback'] = traceback.format_exc()
+
+    return jsonify(results)
+
+
     """
     Scan all recent NPORT-P filings for a filing agent CIK and extract
     the series table from each index page. This tells us which accession
@@ -274,8 +329,8 @@ def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None
                 f'{nodash}/{dashed}-index{ext}'
             )
             try:
-                time.sleep(0.5)  # Generous delay to avoid rate limits
-                r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
+                time.sleep(0.3)  # Polite but not too slow
+                r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=10)
                 if r.ok:
                     matches = re.findall(
                         r'href="(/Archives/edgar/data/[^"]*primary_doc\.xml)"',
@@ -290,7 +345,7 @@ def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None
                         xml_url = 'https://www.sec.gov' + matches[0]
                     break
                 elif r.status_code == 429:
-                    time.sleep(5)  # Back off on rate limit
+                    time.sleep(3)
                     continue
             except Exception:
                 continue
@@ -303,7 +358,7 @@ def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None
 
         # Fetch just the first 4000 bytes of the XML to check series ID
         try:
-            time.sleep(0.5)
+            time.sleep(0.3)
             r = requests.get(
                 xml_url, headers={**EDGAR_HEADERS, 'Range': 'bytes=0-4000'},
                 timeout=15
@@ -603,7 +658,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.5'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.6'})
 
 
 if __name__ == '__main__':
