@@ -22,17 +22,18 @@ _holdings_cache = {}
 CACHE_TTL = 60 * 60 * 6  # 6 hours
 
 # Hardcoded known filings for trust ETFs.
-# Format: ticker -> list of known accessions to try (most recent first)
-# We include multiple in case the server has cycled and old ones are stale.
-# CIK 1479026 = Goldman Sachs ETF Trust
+# 'cik' is the FILER CIK — the entity that actually submits filings to EDGAR.
+# This is often a filing agent, NOT the trust's own CIK.
+# Goldman Sachs ETF Trust (trust CIK 1479026) uses filing agent CIK 0000940400.
+# We discovered this via the /api/debug-submissions diagnostic endpoint.
 HARDCODED_FILINGS = {
     'GPIX': {
-        'cik': '1479026',
+        'cik': '940400',         # Filing agent CIK (not trust CIK)
         'series_id': 'S000081511',
         'class_id': 'C000244421',
     },
     'GPIQ': {
-        'cik': '1479026',
+        'cik': '940400',
         'series_id': 'S000081510',
         'class_id': 'C000244420',
     },
@@ -73,7 +74,7 @@ def debug_submissions():
     Diagnostic endpoint: returns the raw list of recent NPORT-P filings
     for a given CIK, so we can see what accessions exist and debug lookups.
     """
-    cik = request.args.get('cik', '1479026')
+    cik = request.args.get('cik', '940400')
     cik_padded = str(cik).zfill(10)
     try:
         url = f'https://data.sec.gov/submissions/CIK{cik_padded}.json'
@@ -209,8 +210,10 @@ def find_nport_for_series(cik, series_id, class_id=None):
 
         # Try both .htm and .html index URL variants
         for ext in ['.htm', '.html']:
-            index_url = (
-                f'https://www.sec.gov/Archives/edgar/data/{cik_int}/'
+            # Use the filer CIK (filing agent) for the URL path
+        filer_cik_int = int(to_nodash(acc)[:10])
+        index_url = (
+                f'https://www.sec.gov/Archives/edgar/data/{filer_cik_int}/'
                 f'{nodash}/{dashed}-index{ext}'
             )
             try:
@@ -242,9 +245,11 @@ def get_latest_nport_for_cik(cik):
 
 def fetch_nport_xml(cik, accession):
     """Download primary_doc.xml from an NPORT-P filing."""
-    cik_int = int(cik)
     nodash = to_nodash(accession)
     dashed = to_dashed(accession)
+    # The filer CIK is embedded in the accession number's first 10 digits
+    filer_cik = int(nodash[:10])
+    cik_int = filer_cik if filer_cik > 0 else int(cik)
     base = f'https://www.sec.gov/Archives/edgar/data/{cik_int}/{nodash}'
 
     xml_url = None
@@ -488,7 +493,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '8.0'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.0'})
 
 
 if __name__ == '__main__':
