@@ -68,6 +68,30 @@ def get_prices():
 # DIAGNOSTIC ENDPOINT
 # ─────────────────────────────────────────
 
+@app.route('/api/debug-index')
+def debug_index():
+    """Fetch raw text of an NPORT-P filing index page to inspect its contents."""
+    accession = request.args.get('accession', '0000940400-26-028192')
+    nodash = accession.replace('-', '').zfill(18)
+    dashed = f'{nodash[:10]}-{nodash[10:12]}-{nodash[12:]}'
+    filer_cik = int(nodash[:10])
+    results = {'accession': accession, 'nodash': nodash, 'filer_cik': filer_cik}
+    for ext in ['.htm', '.html']:
+        url = f'https://www.sec.gov/Archives/edgar/data/{filer_cik}/{nodash}/{dashed}-index{ext}'
+        results[f'url{ext}'] = url
+        try:
+            r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
+            results[f'status{ext}'] = r.status_code
+            if r.ok:
+                results['content'] = r.text[:3000]
+                results['found'] = True
+                return jsonify(results)
+        except Exception as e:
+            results[f'error{ext}'] = str(e)
+    results['found'] = False
+    return jsonify(results)
+
+
 @app.route('/api/debug-submissions')
 def debug_submissions():
     """
@@ -493,7 +517,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.0'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.1'})
 
 
 if __name__ == '__main__':
