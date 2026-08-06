@@ -28,16 +28,18 @@ CACHE_TTL = 60 * 60 * 6  # 6 hours
 # Goldman Sachs ETF Trust: trust CIK 1479026, filing agent CIK 940400.
 HARDCODED_FILINGS = {
     'GPIX': {
-        'trust_cik': '1479026',   # Submissions JSON lookup
-        'filer_cik': '940400',    # File URL construction
+        'trust_cik': '1479026',
+        'filer_cik': '940400',
         'series_id': 'S000081511',
         'class_id': 'C000244421',
+        'ticker': 'GPIX',
     },
     'GPIQ': {
         'trust_cik': '1479026',
         'filer_cik': '940400',
         'series_id': 'S000081510',
         'class_id': 'C000244420',
+        'ticker': 'GPIQ',
     },
 }
 
@@ -306,23 +308,25 @@ def get_submissions_filings(cik):
     return nports
 
 
-def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None):
+def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None, ticker=None):
     """
     Find the most recent NPORT-P filing for a specific series.
+    Searches index pages for the ticker symbol, series ID, or class ID.
     cik: trust CIK used for submissions JSON lookup
-    override_filer_cik: if set, use this CIK for constructing file URLs
+    override_filer_cik: CIK used for constructing file URLs
+    ticker: the ETF ticker symbol (e.g. 'GPIX') — most reliable search term
     """
     nports = get_submissions_filings(cik)
 
-    for filing in nports[:30]:
+    for filing in nports[:50]:  # Check up to 50 most recent NPORT-Ps
         acc = filing['accession']
         nodash = to_nodash(acc)
-        # Use override filer CIK if provided, otherwise derive from accession
         filer_cik_int = int(override_filer_cik) if override_filer_cik else int(nodash[:10])
         dashed = to_dashed(acc)
 
-        # First get the index page to find the XML URL
+        # Get the index page
         xml_url = None
+        index_content = None
         for ext in ['.htm', '.html']:
             index_url = (
                 f'https://www.sec.gov/Archives/edgar/data/{filer_cik_int}/'
@@ -332,12 +336,12 @@ def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None
                 time.sleep(0.3)
                 r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=10)
                 if r.ok:
-                    # Find all XML links — prefer raw primary_doc.xml over xsl viewer
+                    index_content = r.text
+                    # Find raw XML links (skip xsl viewer)
                     all_xml = re.findall(
                         r'href="(/Archives/edgar/data/[^"]*\.xml)"',
-                        r.text, re.IGNORECASE
+                        index_content, re.IGNORECASE
                     )
-                    # Skip xsl-rendered versions, prefer the raw file
                     raw_xml = [x for x in all_xml if 'xsl' not in x.lower()]
                     chosen = raw_xml[0] if raw_xml else (all_xml[0] if all_xml else None)
                     if chosen:
@@ -345,46 +349,31 @@ def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None
                     break
                 elif r.status_code == 429:
                     time.sleep(3)
-                    continue
             except Exception:
                 continue
 
-        if not xml_url:
-            xml_url = (
-                f'https://www.sec.gov/Archives/edgar/data/{filer_cik_int}/'
-                f'{nodash}/primary_doc.xml'
-            )
-
-        # Fetch just the first 4000 bytes of the XML to check series ID
-        try:
-            time.sleep(0.3)
-            r = requests.get(
-                xml_url, headers={**EDGAR_HEADERS, 'Range': 'bytes=0-4000'},
-                timeout=15
-            )
-            if r.status_code in (200, 206):
-                chunk = r.text
-                if series_id in chunk:
-                    return {
-                        'cik': str(filer_cik_int),
-                        'accession': acc,
-                        'date': filing['date'],
-                        'xml_url': xml_url
-                    }
-                if class_id and class_id in chunk:
-                    return {
-                        'cik': str(filer_cik_int),
-                        'accession': acc,
-                        'date': filing['date'],
-                        'xml_url': xml_url
-                    }
-            elif r.status_code == 429:
-                time.sleep(10)  # Back off significantly
-        except Exception:
+        if index_content is None:
             continue
 
-    return None
+        # Check if this filing belongs to our series
+        # Try ticker first (most reliable), then series_id, then class_id
+        search_terms = []
+        if ticker:
+            search_terms.append(ticker.upper())
+        if series_id:
+            search_terms.append(series_id)
+        if class_id:
+            search_terms.append(class_id)
 
+        if any(term in index_content for term in search_terms):
+            return {
+                'cik': str(filer_cik_int),
+                'accession': acc,
+                'date': filing['date'],
+                'xml_url': xml_url
+            }
+
+    return None
 
 
 def get_latest_nport_for_cik(cik):
@@ -569,7 +558,8 @@ def get_fund_holdings(ticker):
         # Use trust_cik to find the filing in submissions JSON
         # but pass filer_cik so file URLs are constructed correctly
         filing = find_nport_for_series(trust_cik, series_id, class_id,
-                                       override_filer_cik=filer_cik)
+                                       override_filer_cik=filer_cik,
+                                       ticker=ticker_upper)
         if not filing:
             return None, None
 
@@ -652,7 +642,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.7'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.8'})
 
 
 if __name__ == '__main__':
