@@ -22,18 +22,20 @@ _holdings_cache = {}
 CACHE_TTL = 60 * 60 * 6  # 6 hours
 
 # Hardcoded known filings for trust ETFs.
-# 'cik' is the FILER CIK — the entity that actually submits filings to EDGAR.
-# This is often a filing agent, NOT the trust's own CIK.
-# Goldman Sachs ETF Trust (trust CIK 1479026) uses filing agent CIK 0000940400.
-# We discovered this via the /api/debug-submissions diagnostic endpoint.
+# 'trust_cik': used to look up submissions JSON (data.sec.gov/submissions)
+# 'filer_cik': used to construct actual file URLs on sec.gov/Archives
+# These differ when a filing agent submits on behalf of the trust.
+# Goldman Sachs ETF Trust: trust CIK 1479026, filing agent CIK 940400.
 HARDCODED_FILINGS = {
     'GPIX': {
-        'cik': '940400',         # Filing agent CIK (not trust CIK)
+        'trust_cik': '1479026',   # Submissions JSON lookup
+        'filer_cik': '940400',    # File URL construction
         'series_id': 'S000081511',
         'class_id': 'C000244421',
     },
     'GPIQ': {
-        'cik': '940400',
+        'trust_cik': '1479026',
+        'filer_cik': '940400',
         'series_id': 'S000081510',
         'class_id': 'C000244420',
     },
@@ -249,18 +251,19 @@ def get_submissions_filings(cik):
     return nports
 
 
-def find_nport_for_series(cik, series_id, class_id=None):
+def find_nport_for_series(cik, series_id, class_id=None, override_filer_cik=None):
     """
-    Find the most recent NPORT-P filing for a specific series by downloading
-    the first chunk of each XML file and checking for the series ID.
-    This is more reliable than checking index pages which don't contain series IDs.
+    Find the most recent NPORT-P filing for a specific series.
+    cik: trust CIK used for submissions JSON lookup
+    override_filer_cik: if set, use this CIK for constructing file URLs
     """
     nports = get_submissions_filings(cik)
 
     for filing in nports[:30]:
         acc = filing['accession']
         nodash = to_nodash(acc)
-        filer_cik_int = int(nodash[:10])
+        # Use override filer CIK if provided, otherwise derive from accession
+        filer_cik_int = int(override_filer_cik) if override_filer_cik else int(nodash[:10])
         dashed = to_dashed(acc)
 
         # First get the index page to find the XML URL
@@ -509,12 +512,16 @@ def get_fund_holdings(ticker):
     # ── Path 1: Known trust ETFs ──
     if ticker_upper in HARDCODED_FILINGS:
         info = HARDCODED_FILINGS[ticker_upper]
-        cik = info['cik']
+        trust_cik = info['trust_cik']
+        filer_cik = info['filer_cik']
         series_id = info['series_id']
         class_id = info.get('class_id')
 
         time.sleep(0.2)
-        filing = find_nport_for_series(cik, series_id, class_id)
+        # Use trust_cik to find the filing in submissions JSON
+        # but pass filer_cik so file URLs are constructed correctly
+        filing = find_nport_for_series(trust_cik, series_id, class_id,
+                                       override_filer_cik=filer_cik)
         if not filing:
             return None, None
 
@@ -596,7 +603,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.4'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.5'})
 
 
 if __name__ == '__main__':
