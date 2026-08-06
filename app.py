@@ -232,11 +232,12 @@ def find_nport_for_series(cik, series_id, class_id=None):
         dashed = to_dashed(acc)
         cik_int = int(cik)
 
+        # Use the filer CIK embedded in the accession number
+        filer_cik_int = int(to_nodash(acc)[:10])
+
         # Try both .htm and .html index URL variants
         for ext in ['.htm', '.html']:
-            # Use the filer CIK (filing agent) for the URL path
-        filer_cik_int = int(to_nodash(acc)[:10])
-        index_url = (
+            index_url = (
                 f'https://www.sec.gov/Archives/edgar/data/{filer_cik_int}/'
                 f'{nodash}/{dashed}-index{ext}'
             )
@@ -247,10 +248,10 @@ def find_nport_for_series(cik, series_id, class_id=None):
                     content = r.text
                     # Check if this filing belongs to our series
                     if series_id in content:
-                        return {'cik': str(cik), 'accession': acc, 'date': filing['date']}
+                        return {'cik': str(filer_cik_int), 'accession': acc, 'date': filing['date']}
                     # Also check class_id if provided
                     if class_id and class_id in content:
-                        return {'cik': str(cik), 'accession': acc, 'date': filing['date']}
+                        return {'cik': str(filer_cik_int), 'accession': acc, 'date': filing['date']}
                     break  # Index page found but wrong series; move on
             except Exception:
                 continue
