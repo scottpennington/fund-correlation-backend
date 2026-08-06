@@ -21,11 +21,21 @@ _company_tickers = None
 _holdings_cache = {}
 CACHE_TTL = 60 * 60 * 6  # 6 hours
 
-# Known ETF trust series: ticker -> {cik, series_id}
-# cik = trust's CIK, series_id = this fund's series within the trust
-KNOWN_SERIES = {
-    'GPIX': {'cik': '1479026', 'series_id': 'S000081511'},
-    'GPIQ': {'cik': '1479026', 'series_id': 'S000081510'},
+# Hardcoded known filings for trust ETFs.
+# Format: ticker -> list of known accessions to try (most recent first)
+# We include multiple in case the server has cycled and old ones are stale.
+# CIK 1479026 = Goldman Sachs ETF Trust
+HARDCODED_FILINGS = {
+    'GPIX': {
+        'cik': '1479026',
+        'series_id': 'S000081511',
+        'class_id': 'C000244421',
+    },
+    'GPIQ': {
+        'cik': '1479026',
+        'series_id': 'S000081510',
+        'class_id': 'C000244420',
+    },
 }
 
 
@@ -54,16 +64,56 @@ def get_prices():
 
 
 # ─────────────────────────────────────────
+# DIAGNOSTIC ENDPOINT
+# ─────────────────────────────────────────
+
+@app.route('/api/debug-submissions')
+def debug_submissions():
+    """
+    Diagnostic endpoint: returns the raw list of recent NPORT-P filings
+    for a given CIK, so we can see what accessions exist and debug lookups.
+    """
+    cik = request.args.get('cik', '1479026')
+    cik_padded = str(cik).zfill(10)
+    try:
+        url = f'https://data.sec.gov/submissions/CIK{cik_padded}.json'
+        r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        filings = data.get('filings', {}).get('recent', {})
+        forms = filings.get('form', [])
+        accessions = filings.get('accessionNumber', [])
+        dates = filings.get('filingDate', [])
+
+        nports = []
+        for i, form in enumerate(forms):
+            if form in ('NPORT-P', 'NPORT-P/A'):
+                nports.append({
+                    'form': form,
+                    'accession': accessions[i],
+                    'date': dates[i]
+                })
+
+        return jsonify({
+            'cik': cik_padded,
+            'name': data.get('name', ''),
+            'total_recent_filings': len(forms),
+            'nport_filings': nports[:10],  # Show first 10
+            'has_more_pages': bool(data.get('filings', {}).get('files', []))
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ─────────────────────────────────────────
 # ACCESSION UTILITIES
 # ─────────────────────────────────────────
 
 def to_nodash(accession):
-    """Return 18-char nodash accession: 000175272425042696"""
     return accession.strip().replace('-', '').zfill(18)
 
 
 def to_dashed(accession):
-    """Return dashed accession: 0001752724-25-042696"""
     s = to_nodash(accession)
     return f'{s[:10]}-{s[10:12]}-{s[12:]}'
 
@@ -91,85 +141,107 @@ def find_cik_for_ticker(ticker):
     return None
 
 
-def get_submissions(cik):
-    """Fetch the submissions JSON for a CIK from data.sec.gov."""
+def get_submissions_filings(cik):
+    """
+    Fetch ALL NPORT-P filings for a CIK, handling pagination.
+    The SEC submissions API returns 'recent' for the latest batch,
+    and 'files' contains paths to older batches.
+    """
     cik_padded = str(cik).zfill(10)
     url = f'https://data.sec.gov/submissions/CIK{cik_padded}.json'
     r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
 
+    all_accessions = []
+    all_dates = []
+    all_forms = []
 
-def find_nport_for_series(cik, series_id):
-    """
-    Search the submissions JSON for a trust CIK to find the most recent
-    NPORT-P filing that belongs to a specific series ID.
+    # Add recent filings
+    recent = data.get('filings', {}).get('recent', {})
+    all_forms.extend(recent.get('form', []))
+    all_accessions.extend(recent.get('accessionNumber', []))
+    all_dates.extend(recent.get('filingDate', []))
 
-    The SEC submissions JSON has a 'filings.recent' block with parallel arrays.
-    Each filing also has a 'seriesId' field (if set) in an older format,
-    OR we need to check the filing index page for series info.
-
-    Strategy: Get all recent NPORT-P accessions for the trust, then check
-    each index page for the matching series ID. Cache the result.
-    """
-    data = get_submissions(cik)
-    filings = data.get('filings', {}).get('recent', {})
-    forms = filings.get('form', [])
-    accessions = filings.get('accessionNumber', [])
-    dates = filings.get('filingDate', [])
-
-    # Collect all NPORT-P filings for this trust
-    nport_filings = []
-    for i, form in enumerate(forms):
-        if form in ('NPORT-P', 'NPORT-P/A'):
-            nport_filings.append({
-                'accession': accessions[i],
-                'date': dates[i]
-            })
-
-    # Check each filing's index page for the series ID
-    # Start with the most recent and work backwards
-    for filing in nport_filings[:20]:  # Check last 20 NPORT-P filings
-        acc_nodash = to_nodash(filing['accession'])
-        acc_dashed = to_dashed(filing['accession'])
-        index_url = (
-            f'https://www.sec.gov/Archives/edgar/data/{int(cik)}/'
-            f'{acc_nodash}/{acc_dashed}-index.htm'
-        )
+    # Handle pagination — older filings in separate files
+    older_files = data.get('filings', {}).get('files', [])
+    for f in older_files[:3]:  # Check up to 3 older pages
+        fname = f.get('name', '')
+        if not fname:
+            continue
         try:
             time.sleep(0.1)
-            r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
-            if r.ok and series_id in r.text:
-                return {
-                    'cik': str(cik),
-                    'accession': filing['accession'],
-                    'date': filing['date']
-                }
+            r2 = requests.get(
+                f'https://data.sec.gov/submissions/{fname}',
+                headers=EDGAR_HEADERS, timeout=15
+            )
+            if r2.ok:
+                page = r2.json()
+                all_forms.extend(page.get('form', []))
+                all_accessions.extend(page.get('accessionNumber', []))
+                all_dates.extend(page.get('filingDate', []))
         except Exception:
-            continue
+            pass
+
+    # Return only NPORT-P filings
+    nports = []
+    for i, form in enumerate(all_forms):
+        if form in ('NPORT-P', 'NPORT-P/A'):
+            nports.append({
+                'accession': all_accessions[i],
+                'date': all_dates[i]
+            })
+    return nports
+
+
+def find_nport_for_series(cik, series_id, class_id=None):
+    """
+    Find the most recent NPORT-P filing for a specific series
+    by checking each filing's index page for the series_id.
+    """
+    nports = get_submissions_filings(cik)
+
+    for filing in nports[:30]:  # Check up to 30 most recent NPORT-Ps
+        acc = filing['accession']
+        nodash = to_nodash(acc)
+        dashed = to_dashed(acc)
+        cik_int = int(cik)
+
+        # Try both .htm and .html index URL variants
+        for ext in ['.htm', '.html']:
+            index_url = (
+                f'https://www.sec.gov/Archives/edgar/data/{cik_int}/'
+                f'{nodash}/{dashed}-index{ext}'
+            )
+            try:
+                time.sleep(0.12)
+                r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=12)
+                if r.ok:
+                    content = r.text
+                    # Check if this filing belongs to our series
+                    if series_id in content:
+                        return {'cik': str(cik), 'accession': acc, 'date': filing['date']}
+                    # Also check class_id if provided
+                    if class_id and class_id in content:
+                        return {'cik': str(cik), 'accession': acc, 'date': filing['date']}
+                    break  # Index page found but wrong series; move on
+            except Exception:
+                continue
 
     return None
 
 
 def get_latest_nport_for_cik(cik):
-    """Get most recent NPORT-P for a direct filer (CEF, independent ETF)."""
-    data = get_submissions(cik)
-    filings = data.get('filings', {}).get('recent', {})
-    forms = filings.get('form', [])
-    accessions = filings.get('accessionNumber', [])
-    dates = filings.get('filingDate', [])
-    for i, form in enumerate(forms):
-        if form in ('NPORT-P', 'NPORT-P/A'):
-            return {'cik': str(cik), 'accession': accessions[i], 'date': dates[i]}
+    """Most recent NPORT-P for a direct filer (CEF etc)."""
+    nports = get_submissions_filings(cik)
+    if nports:
+        f = nports[0]
+        return {'cik': str(cik), 'accession': f['accession'], 'date': f['date']}
     return None
 
 
 def fetch_nport_xml(cik, accession):
-    """
-    Download primary_doc.xml from an NPORT-P filing.
-    URL pattern: /Archives/edgar/data/{CIK_INT}/{NODASH}/{DASHED}-index.htm
-    XML is at: /Archives/edgar/data/{CIK_INT}/{NODASH}/primary_doc.xml
-    """
+    """Download primary_doc.xml from an NPORT-P filing."""
     cik_int = int(cik)
     nodash = to_nodash(accession)
     dashed = to_dashed(accession)
@@ -177,28 +249,28 @@ def fetch_nport_xml(cik, accession):
 
     xml_url = None
 
-    # Try index page first to find the exact XML filename
-    index_url = f'{base}/{dashed}-index.htm'
-    try:
-        r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=15)
-        if r.ok:
-            # Find href to primary_doc.xml
-            matches = re.findall(
-                r'href="(/Archives/edgar/data/[^"]*primary_doc\.xml)"',
-                r.text, re.IGNORECASE
-            )
-            if matches:
-                xml_url = 'https://www.sec.gov' + matches[0]
-            else:
-                # Find any .xml file
+    # Try index page (.htm then .html)
+    for ext in ['.htm', '.html']:
+        index_url = f'{base}/{dashed}-index{ext}'
+        try:
+            r = requests.get(index_url, headers=EDGAR_HEADERS, timeout=12)
+            if r.ok:
+                matches = re.findall(
+                    r'href="(/Archives/edgar/data/[^"]*primary_doc\.xml)"',
+                    r.text, re.IGNORECASE
+                )
+                if matches:
+                    xml_url = 'https://www.sec.gov' + matches[0]
+                    break
                 matches = re.findall(
                     r'href="(/Archives/edgar/data/[^"]*\.xml)"',
                     r.text, re.IGNORECASE
                 )
                 if matches:
                     xml_url = 'https://www.sec.gov' + matches[0]
-    except Exception:
-        pass
+                    break
+        except Exception:
+            continue
 
     if not xml_url:
         xml_url = f'{base}/primary_doc.xml'
@@ -214,7 +286,6 @@ def fetch_nport_xml(cik, accession):
 # ─────────────────────────────────────────
 
 def parse_nport_xml(xml_content):
-    """Parse holdings from N-PORT XML."""
     try:
         root = ET.fromstring(xml_content)
     except ET.ParseError:
@@ -277,7 +348,7 @@ def parse_nport_xml(xml_content):
 
 
 # ─────────────────────────────────────────
-# OVERLAP CALCULATION
+# OVERLAP
 # ─────────────────────────────────────────
 
 def normalize_key(h):
@@ -326,7 +397,6 @@ def calculate_overlap(holdings_a, holdings_b):
 # ─────────────────────────────────────────
 
 def get_fund_holdings(ticker):
-    """Returns (holdings_list, filing_date) for any ticker."""
     ticker_upper = ticker.upper()
     now = time.time()
 
@@ -335,14 +405,15 @@ def get_fund_holdings(ticker):
         if now - c['ts'] < CACHE_TTL:
             return c['holdings'], c['date']
 
-    # ── Path 1: Known trust ETFs — scan submissions for matching series ──
-    if ticker_upper in KNOWN_SERIES:
-        info = KNOWN_SERIES[ticker_upper]
+    # ── Path 1: Known trust ETFs ──
+    if ticker_upper in HARDCODED_FILINGS:
+        info = HARDCODED_FILINGS[ticker_upper]
         cik = info['cik']
         series_id = info['series_id']
+        class_id = info.get('class_id')
 
         time.sleep(0.2)
-        filing = find_nport_for_series(cik, series_id)
+        filing = find_nport_for_series(cik, series_id, class_id)
         if not filing:
             return None, None
 
@@ -355,7 +426,7 @@ def get_fund_holdings(ticker):
             }
         return holdings, filing['date']
 
-    # ── Path 2: Direct filers (CEFs, independent ETFs) ──
+    # ── Path 2: Direct filers (CEFs etc) ──
     cik = find_cik_for_ticker(ticker_upper)
     if not cik:
         return None, None
@@ -417,7 +488,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '7.0'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '8.0'})
 
 
 if __name__ == '__main__':
