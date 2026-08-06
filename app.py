@@ -83,7 +83,18 @@ def debug_index():
             r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
             results[f'status{ext}'] = r.status_code
             if r.ok:
-                results['content'] = r.text[:3000]
+                full = r.text
+                results['content_length'] = len(full)
+                results['content'] = full[:500]  # just the start
+                # Search for key identifiers
+                results['has_S000081511'] = 'S000081511' in full
+                results['has_C000244421'] = 'C000244421' in full
+                results['has_GPIX'] = 'GPIX' in full
+                # Extract a snippet around any series ID found
+                for needle in ['S000081511', 'C000244421', 'GPIX', 'seriesId', 'Series']:
+                    idx = full.find(needle)
+                    if idx >= 0:
+                        results[f'snippet_{needle}'] = full[max(0,idx-100):idx+200]
                 results['found'] = True
                 return jsonify(results)
         except Exception as e:
@@ -518,7 +529,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.1'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '9.2'})
 
 
 if __name__ == '__main__':
