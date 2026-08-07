@@ -367,7 +367,9 @@ def debug_gpix():
         out['scanning'] = []
 
         # Scan filings one by one until we find GPIX
-        for i, filing in enumerate(filings[:20]):
+        for i, filing in enumerate(filings[:40]):
+            if i < 20:
+                continue  # Already checked these
             acc = filing['accession']
             content = get_index_page(info['filer_cik'], acc)
             has_gpix = 'GPIX' in (content or '')
@@ -435,7 +437,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '11.1'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '11.2'})
 
 
 if __name__ == '__main__':
