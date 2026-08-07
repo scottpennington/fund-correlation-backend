@@ -364,25 +364,35 @@ def debug_gpix():
         info = KNOWN_TRUST_ETFS['GPIX']
         filings = get_nport_filings(info['trust_cik'])
         out['total_nport_filings'] = len(filings)
-        out['first_3'] = filings[:3]
+        out['scanning'] = []
 
-        # Fetch first filing's full index page
-        acc = filings[0]['accession']
-        out['testing_accession'] = acc
-        content = get_index_page(info['filer_cik'], acc)
-        out['index_fetched'] = content is not None
-        out['index_length'] = len(content) if content else 0
-
-        if content:
-            out['has_GPIX'] = 'GPIX' in content
-            out['has_series_id'] = info['series_id'] in content
-
-            # Show full series section
-            idx = content.find('seriesDiv')
-            out['series_section'] = content[idx:] if idx >= 0 else content[-2000:]
-
-            # Also show XML URL found
-            out['xml_url'] = extract_xml_url(content, info['trust_cik'])
+        # Scan filings one by one until we find GPIX
+        for i, filing in enumerate(filings[:20]):
+            acc = filing['accession']
+            content = get_index_page(info['filer_cik'], acc)
+            has_gpix = 'GPIX' in (content or '')
+            has_sid  = info['series_id'] in (content or '')
+            ticker_found = None
+            # Extract whichever ticker is in this filing
+            if content:
+                m = re.search(r'<td>([A-Z]{2,6})</td>\s*</tr>\s*</table>', content)
+                if m:
+                    ticker_found = m.group(1)
+            entry = {
+                'index': i,
+                'accession': acc,
+                'date': filing['date'],
+                'fetched': content is not None,
+                'has_GPIX': has_gpix,
+                'has_series_id': has_sid,
+                'ticker_in_filing': ticker_found
+            }
+            out['scanning'].append(entry)
+            if has_gpix or has_sid:
+                out['FOUND_AT_INDEX'] = i
+                out['FOUND_ACCESSION'] = acc
+                out['xml_url'] = extract_xml_url(content, info['trust_cik'])
+                break
 
     except Exception as e:
         out['error'] = str(e)
@@ -425,7 +435,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '11.0'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '11.1'})
 
 
 if __name__ == '__main__':
