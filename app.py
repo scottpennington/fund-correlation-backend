@@ -20,8 +20,20 @@ CACHE_TTL = 60 * 60 * 6
 
 # Goldman Sachs ETF Trust: trust CIK 1479026, filing agent CIK 940400
 KNOWN_TRUST_ETFS = {
-    'GPIX': {'trust_cik': '1479026', 'filer_cik': '940400', 'series_id': 'S000081511'},
-    'GPIQ': {'trust_cik': '1479026', 'filer_cik': '940400', 'series_id': 'S000081510'},
+    'GPIX': {
+        'trust_cik': '1479026',
+        'filer_cik': '940400',
+        'series_id': 'S000081511',
+        # Hardcoded most recent known accession — used as fast path.
+        # Falls back to scanning if this filing is no longer the most recent.
+        'known_accession': '0000940400-26-022162',
+        'known_date': '2026-05-29',
+    },
+    'GPIQ': {
+        'trust_cik': '1479026',
+        'filer_cik': '940400',
+        'series_id': 'S000081510',
+    },
 }
 
 
@@ -323,6 +335,26 @@ def get_fund_holdings(ticker):
     # Path 1: Known trust ETFs
     if ticker_upper in KNOWN_TRUST_ETFS:
         info = KNOWN_TRUST_ETFS[ticker_upper]
+
+        # Fast path: use hardcoded known accession if available
+        if info.get('known_accession'):
+            try:
+                xml = fetch_xml(info['trust_cik'], info['known_accession'],
+                                xml_url=f"https://www.sec.gov/Archives/edgar/data/"
+                                        f"{info['trust_cik']}/{nd(info['known_accession'])}/"
+                                        f"primary_doc.xml")
+                holdings = parse_holdings(xml)
+                if holdings:
+                    _holdings_cache[ticker_upper] = {
+                        'holdings': holdings,
+                        'date': info['known_date'],
+                        'ts': now
+                    }
+                    return holdings, info['known_date']
+            except Exception:
+                pass  # Fall through to scanning
+
+        # Slow path: scan filings to find the right one
         filing = find_filing_for_series(
             info['trust_cik'], info['filer_cik'],
             ticker_upper, info['series_id']
@@ -437,7 +469,7 @@ def holdings_overlap():
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Fund Correlation API is running', 'version': '11.3'})
+    return jsonify({'status': 'Fund Correlation API is running', 'version': '11.4'})
 
 
 if __name__ == '__main__':
